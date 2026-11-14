@@ -17,4 +17,7 @@
   <ItemGroup>
     <EmbeddedResource Include="payload.zip" LogicalName="ClaudeZhStandalone.payload.zip" />
   </ItemGroup>
+  <Target Name="EnsurePayloadZip" BeforeTargets="BeforeBuild;PrepareResources" Condition="!Exists('$(MSBuildProjectDirectory)\payload.zip')">
+    <Exec Command="powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\build-payload.ps1&quot;" />
+  </Target>
 </Project>

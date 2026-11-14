@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { cp, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const read = (path) => readFile(fileURLToPath(new URL(`../${path}`, import.meta.url)), "utf8");
@@ -148,4 +150,73 @@ test("提权路径不通过 ProcessStartInfo 设置环境变量", async () => {
   assert.ok(!body.includes("psi.Environment["), "提权分支不得设置 psi.Environment");
   assert.match(body, /UseShellExecute = true/, "提权分支使用 ShellExecute");
   assert.match(program, /\$env:CLAUDE_ZH_STAGE_LOG = /, "环境变量改由包装脚本设置");
+});
+
+test("独立包资源构建脚本语法合法且与项目构建目标一致", async () => {
+  const csproj = await read("standalone/ClaudeZhStandalone.csproj");
+  assert.match(csproj, /<Target\s+Name="EnsurePayloadZip"/, "项目文件声明前置资源生成目标");
+  assert.match(csproj, /BeforeTargets="BeforeBuild;PrepareResources"/, "前置生成绑定到编译与资源准备阶段前");
+  assert.match(csproj, /Condition="!Exists\('\$\(MSBuildProjectDirectory\)\\payload\.zip'\)"/, "仅在缺失资源压缩包时自动生成");
+  assert.match(csproj, /build-payload\.ps1/, "编译目标调用统一的资源打包脚本");
+
+  const publish = await read("standalone/publish.ps1");
+  assert.match(publish, /build-payload\.ps1/, "发布脚本复用资源打包脚本");
+  assert.ok(!publish.includes("CreateFromDirectory"), "发布脚本不应重复实现压缩打包逻辑");
+
+  if (process.platform === "win32") {
+    const buildPayloadPath = fileURLToPath(new URL("../standalone/build-payload.ps1", import.meta.url));
+    const escapedPath = buildPayloadPath.replaceAll("'", "''");
+    const psCmd = `$errors = $null; [System.Management.Automation.Language.Parser]::ParseFile('${escapedPath}', [ref]$null, [ref]$errors) | Out-Null; if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }`;
+    const res = spawnSync("powershell.exe", ["-NoProfile", "-Command", psCmd], { encoding: "utf8" });
+    assert.equal(res.status, 0, `资源打包脚本语法校验失败: ${res.stderr}`);
+  }
+});
+
+test("干净检出缺少 payload.zip 时直接执行 dotnet build 可自动补齐并完成编译", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("仅在 Windows 环境验证桌面端项目编译");
+    return;
+  }
+
+  const repoRoot = fileURLToPath(new URL("..", import.meta.url));
+  const sandbox = await mkdtemp(join(tmpdir(), "claude-zh-clean-build-"));
+  try {
+    await cp(join(repoRoot, "scripts"), join(sandbox, "scripts"), { recursive: true });
+    await cp(join(repoRoot, "resources"), join(sandbox, "resources"), { recursive: true });
+    await cp(join(repoRoot, "standalone"), join(sandbox, "standalone"), {
+      recursive: true,
+      filter: (src) => {
+        const normalized = src.replaceAll("\\", "/");
+        return (
+          !normalized.endsWith("/standalone/bin") &&
+          !normalized.endsWith("/standalone/obj") &&
+          !normalized.endsWith("/standalone/payload.zip")
+        );
+      },
+    });
+
+    const payloadPath = join(sandbox, "standalone", "payload.zip");
+    await assert.rejects(() => stat(payloadPath), "隔离构建前工作目录不应预先包含 payload.zip");
+
+    const buildRes = spawnSync(
+      "dotnet",
+      ["build", "standalone/ClaudeZhStandalone.csproj", "-c", "Release", "-p:EnableDefaultItems=true"],
+      { cwd: sandbox, encoding: "utf8", timeout: 120_000 }
+    );
+    assert.equal(buildRes.status, 0, `干净目录编译失败:\n${buildRes.stdout}\n${buildRes.stderr}`);
+
+    const zipStat = await stat(payloadPath);
+    assert.ok(zipStat.size > 0, "编译阶段应自动产出非空 payload.zip");
+
+    const escapedZip = payloadPath.replaceAll("'", "''");
+    const inspectCmd = `Add-Type -AssemblyName System.IO.Compression.FileSystem; $zip = [IO.Compression.ZipFile]::OpenRead('${escapedZip}'); try { $zip.Entries | ForEach-Object { $_.FullName.Replace([char]92, [char]47) } } finally { $zip.Dispose() }`;
+    const inspectRes = spawnSync("powershell.exe", ["-NoProfile", "-Command", inspectCmd], { encoding: "utf8" });
+    assert.equal(inspectRes.status, 0, `检查资源压缩包条目失败: ${inspectRes.stderr}`);
+
+    const entries = inspectRes.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    assert.ok(entries.includes("scripts/install_windows.ps1"), "资源压缩包必须包含 Windows 安装脚本");
+    assert.ok(entries.some((e) => e.startsWith("resources/") && e.endsWith(".json")), "资源压缩包必须包含语言包 JSON 文件");
+  } finally {
+    await rm(sandbox, { recursive: true, force: true });
+  }
 });
