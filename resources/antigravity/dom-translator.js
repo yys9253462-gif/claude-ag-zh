@@ -4,7 +4,7 @@
   if (
     window.__antigravityZhPatchInstalled === CURRENT_PATCH_VERSION &&
     window.__antigravityZhPatchObserver &&
-    document.documentElement.lang === 'zh-CN'
+    document.documentElement?.lang === 'zh-CN'
   ) {
     return;
   }
@@ -282,7 +282,7 @@
     return out.length > 0 ? out.join('，') : null;
   }
 
-  function translateCoreUnit(trimmed) {
+  function translateCoreUnit(trimmed, allowSplit = true) {
     if (!trimmed) return null;
     if (translationCache.has(trimmed)) {
       return translationCache.get(trimmed);
@@ -350,23 +350,34 @@
       return cacheSet(trimmed, `${formatDuration(m[1])}前更新`);
     }
 
+    // 超长非精确词典文本跳过线性正则级联与多句切分，避免渲染帧卡顿
+    if (n.length > 500) return cacheSet(trimmed, null);
+
     // 5. 338 Cascading Regex Patterns (from yiheng8023 v2.26.0 suite)
     for (let i = 0; i < compiledPatterns.length; i++) {
       const p = compiledPatterns[i];
+      p.regex.lastIndex = 0;
       if (p.regex.test(n)) {
+        p.regex.lastIndex = 0;
         let res = n.replace(p.regex, p.replacement);
-        for (let j = 0; j < compiledPatterns.length; j++) {
-          if (compiledPatterns[j].regex.test(res)) {
-            res = res.replace(compiledPatterns[j].regex, compiledPatterns[j].replacement);
+        if (/[A-Za-z]/.test(res)) {
+          for (let j = 0; j < compiledPatterns.length; j++) {
+            if (j === i) continue;
+            const inner = compiledPatterns[j];
+            inner.regex.lastIndex = 0;
+            if (inner.regex.test(res)) {
+              inner.regex.lastIndex = 0;
+              res = res.replace(inner.regex, inner.replacement);
+              if (!/[A-Za-z]/.test(res)) break;
+            }
           }
         }
-        p.regex.lastIndex = 0;
         return cacheSet(trimmed, res);
       }
     }
 
     // 6. Full-sentence conservation multi-sentence splitter
-    if (n.includes('. ') || n.includes('! ') || n.includes('? ')) {
+    if (allowSplit && (n.includes('. ') || n.includes('! ') || n.includes('? '))) {
       const sentences = n.split(/([.!?]\s+)/);
       let anyTranslated = false;
       let allTranslated = true;
@@ -378,7 +389,7 @@
           parts.push(part.replace(/\.\s*/g, '。'));
           continue;
         }
-        const subTrans = exactMap.get(tPart) || exactMap.get(tPart + '.') || translateCoreUnit(tPart);
+        const subTrans = exactMap.get(tPart) || exactMap.get(tPart + '.') || translateCoreUnit(tPart, false);
         if (subTrans && subTrans !== tPart) {
           anyTranslated = true;
           parts.push(subTrans);
@@ -415,10 +426,25 @@
     return tr || lbl;
   };
 
+  function translateContextMenuItems(items, translator) {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (!item || typeof item !== 'object') continue;
+      if (typeof item.label === 'string' && item.label) {
+        item.label = translator(item.label);
+      }
+      if (Array.isArray(item.submenu)) {
+        translateContextMenuItems(item.submenu, translator);
+      }
+    }
+  }
+
   if (!window.__antigravityOrigArrayMap) {
+    let inMapHook = false;
     window.__antigravityOrigArrayMap = Array.prototype.map;
     Array.prototype.map = function(fn, thisArg) {
       const res = window.__antigravityOrigArrayMap.call(this, fn, thisArg);
+      if (inMapHook) return res;
       try {
         if (
           res &&
@@ -430,15 +456,17 @@
         ) {
           const translator = window.__antigravityContextMenuTranslate;
           if (translator) {
-            for (let i = 0; i < res.length; i++) {
-              const item = res[i];
-              if (item && typeof item.label === 'string' && item.label) {
-                item.label = translator(item.label);
-              }
+            inMapHook = true;
+            try {
+              translateContextMenuItems(res, translator);
+            } finally {
+              inMapHook = false;
             }
           }
         }
-      } catch {}
+      } catch {
+        inMapHook = false;
+      }
       return res;
     };
   }
@@ -694,7 +722,18 @@
     } catch {}
   }
 
+  let hasInitialized = false;
+  let bootFallbackTimer = null;
+
   function run() {
+    if (hasInitialized) return;
+    if (!document.documentElement) return;
+    hasInitialized = true;
+    if (bootFallbackTimer) {
+      clearTimeout(bootFallbackTimer);
+      bootFallbackTimer = null;
+    }
+
     try {
       document.documentElement.lang = 'zh-CN';
     } catch {}
@@ -747,6 +786,9 @@
 
     // Hover & ContextMenu quick portal scanner (100ms throttled + 45ms debounced)
     try {
+      if (window.__antigravityHoverCleanup) {
+        try { window.__antigravityHoverCleanup(); } catch {}
+      }
       let lastHover = 0;
       let hoverTimer = null;
       const onPointerOrMenu = (e) => {
@@ -766,12 +808,19 @@
       document.addEventListener('pointerenter', onPointerOrMenu, { capture: true, passive: true });
       document.addEventListener('contextmenu', onPointerOrMenu, { capture: true, passive: true });
       window.__antigravityHoverCleanup = () => {
+        if (hoverTimer) {
+          clearTimeout(hoverTimer);
+          hoverTimer = null;
+        }
         document.removeEventListener('pointerenter', onPointerOrMenu, { capture: true });
         document.removeEventListener('contextmenu', onPointerOrMenu, { capture: true });
       };
     } catch {}
 
     // Low-frequency 15s idle fallback scan
+    if (window.__antigravityIdleInterval) {
+      try { clearInterval(window.__antigravityIdleInterval); } catch {}
+    }
     window.__antigravityIdleInterval = setInterval(() => {
       if (typeof requestIdleCallback === 'function') {
         requestIdleCallback(() => translateSubtree(document), { timeout: 4000 });
@@ -783,7 +832,7 @@
 
   if (document.readyState === 'loading') {
     window.addEventListener('DOMContentLoaded', run, { once: true });
-    setTimeout(run, 600);
+    bootFallbackTimer = setTimeout(run, 600);
   } else {
     run();
   }

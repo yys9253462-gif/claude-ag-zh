@@ -9,8 +9,8 @@
     <RootNamespace>ClaudeZhStandalone</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\ClaudeDesktop-ZH-CN.ico</ApplicationIcon>
-    <Version>0.3.2</Version>
-    <Description>Claude Desktop Windows 一键中文补丁</Description>
+    <Version>0.4.1</Version>
+    <Description>Claude Desktop &amp; Antigravity Windows 一键中文补丁</Description>
     <EnableDefaultContentItems>false</EnableDefaultContentItems>
     <EnableDefaultNoneItems>false</EnableDefaultNoneItems>
   </PropertyGroup>

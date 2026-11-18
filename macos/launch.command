@@ -32,7 +32,7 @@ for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/pytho
 done
 if [ -z "$PYTHON" ]; then
     printf '%s\n' '需要 Python 3.10 或更新版本。请从 https://www.python.org/downloads/macos/ 安装后再打开本工具。'
-    /usr/bin/osascript -e 'display dialog "需要 Python 3.10 或更新版本。请从 python.org 安装后重试。尚未关闭或修改 Claude。" with title "Claude Desktop 中文助手" buttons {"知道了"} default button "知道了"' >/dev/null
+    /usr/bin/osascript -e 'display dialog "需要 Python 3.10 或更新版本。请从 python.org 安装后重试。尚未关闭或修改 Claude。" with title "Claude Desktop 中文助手" buttons {"知道了"} default button "知道了"' >/dev/null || true
     exit 1
 fi
 
@@ -42,7 +42,7 @@ if [ ! -d "$APP" ]; then
     APP="$HOME/Applications/Claude.app"
 fi
 if [ ! -d "$APP/Contents" ]; then
-    /usr/bin/osascript -e 'display dialog "未找到 Claude.app。请先将 Claude 安装到 /Applications 或用户 Applications 文件夹。" with title "Claude Desktop 中文助手" buttons {"知道了"} default button "知道了"' >/dev/null
+    /usr/bin/osascript -e 'display dialog "未找到 Claude.app。请先将 Claude 安装到 /Applications 或用户 Applications 文件夹。" with title "Claude Desktop 中文助手" buttons {"知道了"} default button "知道了"' >/dev/null || true
     exit 1
 fi
 
@@ -64,7 +64,7 @@ esac
 if [ "$ACTION" = restore ]; then
     backups=("$(dirname "$APP")"/Claude.backup-before-zh-CN-*.app)
     if [ ! -d "${backups[0]}" ]; then
-        /usr/bin/osascript -e 'display dialog "未找到安装前备份，无需执行恢复。Claude 没有被关闭。" with title "Claude Desktop 中文助手" buttons {"知道了"} default button "知道了"' >/dev/null
+        /usr/bin/osascript -e 'display dialog "未找到安装前备份，无需执行恢复。Claude 没有被关闭。" with title "Claude Desktop 中文助手" buttons {"知道了"} default button "知道了"' >/dev/null || true
         exit 0
     fi
 fi

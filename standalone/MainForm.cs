@@ -5,6 +5,7 @@ namespace ClaudeZhStandalone;
 
 public sealed class MainForm : Form
 {
+    private const int MaxLogLength = 120_000;
     private static readonly Color Background = Color.FromArgb(247, 245, 241);
     private static readonly Color Ink = Color.FromArgb(47, 40, 42);
     private static readonly Color Muted = Color.FromArgb(124, 111, 107);
@@ -58,7 +59,8 @@ public sealed class MainForm : Form
         var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Padding = new Padding(30, 24, 30, 10), BackColor = Background };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 78));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        var icon = new PictureBox { Image = AppIcon.Create(96).ToBitmap(), Size = new Size(62, 62), SizeMode = PictureBoxSizeMode.Zoom, Anchor = AnchorStyles.Left };
+        using var headerIcon = AppIcon.Create(96);
+        var icon = new PictureBox { Image = headerIcon.ToBitmap(), Size = new Size(62, 62), SizeMode = PictureBoxSizeMode.Zoom, Anchor = AnchorStyles.Left };
         var titles = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, Padding = new Padding(0, 3, 0, 0) };
         titles.Controls.Add(new Label { Text = "Claude Desktop & Antigravity 中文助手", Font = new Font("Microsoft YaHei UI", 19F, FontStyle.Bold), AutoSize = true, ForeColor = Ink });
         titles.Controls.Add(new Label { Text = "支持双桌面端本地汉化与无损还原  /  独立 Windows 版（零外部依赖）", Font = new Font("Microsoft YaHei UI", 9F), AutoSize = true, ForeColor = Muted, Padding = new Padding(0, 7, 0, 0) });
@@ -136,7 +138,7 @@ public sealed class MainForm : Form
         {
             var appName = IsAntigravity ? "Antigravity" : "Claude Desktop";
             if (MessageBox.Show($"将关闭 {appName}，并使用备份恢复官方文件。继续吗？", "恢复官方文件", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
-                await RunAsync("uninstall");
+                await RunAsync("uninstall", skipRunningPrompt: true);
         };
         return layout;
     }
@@ -169,11 +171,11 @@ public sealed class MainForm : Form
         }
     }
 
-    private async Task RunAsync(string action)
+    private async Task RunAsync(string action, bool skipRunningPrompt = false)
     {
         if (busy) return;
 
-        if (!IsAntigravity && Installer.IsClaudeRunning())
+        if (!skipRunningPrompt && !IsAntigravity && Installer.IsClaudeRunning())
         {
             var answer = MessageBox.Show(
                 "检测到 Claude Desktop 正在运行。\n\n" +
@@ -182,7 +184,7 @@ public sealed class MainForm : Form
                 "请先关闭 Claude", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
             if (answer != DialogResult.Yes) return;
         }
-        else if (IsAntigravity && Installer.IsAntigravityRunning())
+        else if (!skipRunningPrompt && IsAntigravity && Installer.IsAntigravityRunning())
         {
             var answer = MessageBox.Show(
                 "检测到 Antigravity 正在运行。\n\n" +
@@ -198,11 +200,12 @@ public sealed class MainForm : Form
         status.Text = action == "install" ? $"正在为 {TargetName} 安装{LanguageName}，请稍候…" : $"正在恢复 {TargetName} 官方文件…";
         log.Clear();
         AppendLog(action == "install" ? $"开始：检测 {TargetName} 并安装{LanguageName}（{LanguageCode}）。" : $"开始：为 {TargetName} 恢复官方文件。");
+        var payloadRoot = Installer.PayloadRoot;
         try
         {
             var result = await Installer.RunAsync(action, LanguageCode, ownership.Checked,
                 Path.Combine(Path.GetTempPath(), "ClaudeDesktop-ZH-CN"),
-                Path.Combine(Installer.PayloadRoot, "scripts"), Path.Combine(Installer.PayloadRoot, "resources"),
+                Path.Combine(payloadRoot, "scripts"), Path.Combine(payloadRoot, "resources"),
                 AppendLog, target: TargetCode);
             var success = result.ExitCode == 0;
             status.Text = success
@@ -227,8 +230,17 @@ public sealed class MainForm : Form
 
     private void AppendLog(string text)
     {
-        if (string.IsNullOrWhiteSpace(text)) return;
-        if (InvokeRequired) { BeginInvoke(() => AppendLog(text)); return; }
+        if (string.IsNullOrWhiteSpace(text) || IsDisposed || Disposing) return;
+        if (InvokeRequired)
+        {
+            try { BeginInvoke(() => AppendLog(text)); } catch { }
+            return;
+        }
+        if (log.TextLength > MaxLogLength)
+        {
+            log.Text = log.Text[(log.TextLength - MaxLogLength / 2)..];
+            log.SelectionStart = log.TextLength;
+        }
         log.AppendText(text + Environment.NewLine);
     }
 }

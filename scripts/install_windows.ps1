@@ -39,6 +39,7 @@ $ErrorActionPreference = "Stop"
 
 function Disable-ConsoleQuickEdit {
     try {
+        if ([Console]::IsInputRedirected) { return }
         if (-not ("ClaudeZh.ConsoleModeHelper" -as [type])) {
             Add-Type -TypeDefinition @"
 using System;
@@ -859,7 +860,8 @@ function Get-RelativeResourcePath {
 
     $root = [System.IO.Path]::GetFullPath($ResourcesPath).TrimEnd('\', '/')
     $full = [System.IO.Path]::GetFullPath($FilePath)
-    if (-not $full.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+    $rootWithSep = $root + [System.IO.Path]::DirectorySeparatorChar
+    if (-not ($full.Equals($root, [System.StringComparison]::OrdinalIgnoreCase) -or $full.StartsWith($rootWithSep, [System.StringComparison]::OrdinalIgnoreCase))) {
         throw "备份目标不在 Claude resources 目录内: $FilePath"
     }
 
@@ -905,7 +907,8 @@ function Backup-AppFile {
     $appPath = Get-ClaudeAppPathFromResources $ResourcesPath
     $appRoot = [System.IO.Path]::GetFullPath($appPath).TrimEnd('\', '/')
     $full = [System.IO.Path]::GetFullPath($FilePath)
-    if (-not $full.StartsWith($appRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+    $appRootWithSep = $appRoot + [System.IO.Path]::DirectorySeparatorChar
+    if (-not ($full.Equals($appRoot, [System.StringComparison]::OrdinalIgnoreCase) -or $full.StartsWith($appRootWithSep, [System.StringComparison]::OrdinalIgnoreCase))) {
         throw "备份目标不在 Claude app 目录内: $FilePath"
     }
 
@@ -2039,6 +2042,90 @@ function Get-ClaudeExeIntegrityMarker {
     throw "Could not find Claude.exe $AsarName integrity marker. Claude bundle format may have changed."
 }
 
+function Find-ClaudeExeIntegrityHashOffset {
+    param(
+        [string]$ExePath,
+        [string]$AsarName
+    )
+
+    # 流式滑动窗口扫描（1MB 缓冲），避免把 238MB+ 的 Claude.exe 反复 ReadAllText 转成 476MB UTF-16 字符串撑爆 LOH。
+    $bs = [string][char]92
+    $fw = [string][char]47
+    $tail = '","alg":"SHA256","value":"'
+    $candidates = @(
+        ('{"file":"resources' + $bs + $bs + $AsarName + $tail),
+        ('resources' + $bs + $bs + $AsarName + $tail),
+        ('{"file":"resources' + $fw + $AsarName + $tail),
+        ('resources' + $fw + $AsarName + $tail),
+        ('resources' + $bs + $AsarName + $tail)
+    )
+    $patterns = [System.Collections.Generic.List[byte[]]]::new()
+    $maxLen = 0
+    foreach ($cand in $candidates) {
+        $patBytes = [System.Text.Encoding]::ASCII.GetBytes($cand)
+        $patterns.Add($patBytes)
+        if ($patBytes.Length -gt $maxLen) { $maxLen = $patBytes.Length }
+    }
+    $hitCounts = [int[]]::new($patterns.Count)
+    $firstOffsets = [int64[]]::new($patterns.Count)
+    for ($i = 0; $i -lt $patterns.Count; $i++) { $firstOffsets[$i] = -1 }
+
+    $chunkSize = 1048576
+    $overlap = $maxLen - 1
+    $buffer = [byte[]]::new($chunkSize + $overlap)
+    $stream = [System.IO.File]::Open($ExePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try {
+        $carry = 0
+        $basePos = [int64]0
+        while ($true) {
+            $read = $stream.Read($buffer, $carry, $chunkSize)
+            if ($read -le 0) { break }
+            $total = $carry + $read
+            for ($pIdx = 0; $pIdx -lt $patterns.Count; $pIdx++) {
+                if ($hitCounts[$pIdx] -ge 2) { continue }
+                $pat = $patterns[$pIdx]
+                $searchFrom = 0
+                while ($searchFrom -le ($total - $pat.Length)) {
+                    $found = [Array]::IndexOf($buffer, $pat[0], $searchFrom, $total - $pat.Length - $searchFrom + 1)
+                    if ($found -lt 0) { break }
+                    $matched = $true
+                    for ($k = 1; $k -lt $pat.Length; $k++) {
+                        if ($buffer[$found + $k] -ne $pat[$k]) { $matched = $false; break }
+                    }
+                    if ($matched) {
+                        $absPos = $basePos - $carry + $found
+                        if ($hitCounts[$pIdx] -eq 0 -or $absPos -ne $firstOffsets[$pIdx]) {
+                            if ($hitCounts[$pIdx] -eq 0) { $firstOffsets[$pIdx] = $absPos }
+                            $hitCounts[$pIdx]++
+                            if ($hitCounts[$pIdx] -ge 2) { break }
+                        }
+                    }
+                    $searchFrom = $found + 1
+                }
+            }
+            if ($total -gt $overlap) {
+                [Buffer]::BlockCopy($buffer, $total - $overlap, $buffer, 0, $overlap)
+                $carry = $overlap
+            } else {
+                $carry = $total
+            }
+            $basePos += $read
+        }
+    } finally {
+        $stream.Dispose()
+    }
+
+    for ($pIdx = 0; $pIdx -lt $patterns.Count; $pIdx++) {
+        if ($hitCounts[$pIdx] -eq 0) { continue }
+        if ($hitCounts[$pIdx] -gt 1) {
+            throw "Could not find a unique Claude.exe $AsarName integrity marker. Claude bundle format may have changed."
+        }
+        return ($firstOffsets[$pIdx] + $patterns[$pIdx].Length)
+    }
+
+    throw "Could not find Claude.exe $AsarName integrity marker. Claude bundle format may have changed."
+}
+
 function Assert-ClaudeExeIntegrityMarkers {
     param([string]$ResourcesPath)
 
@@ -2054,10 +2141,8 @@ function Assert-ClaudeExeIntegrityMarkers {
     }
 
     Write-Host "  [进度] 正在校验 Claude.exe 完整性标记..." -ForegroundColor DarkGray
-    $exeText = [System.IO.File]::ReadAllText($exePath, [System.Text.Encoding]::ASCII)
     foreach ($asarName in $targets) {
-        $marker = Get-ClaudeExeIntegrityMarker -ExeText $exeText -AsarName $asarName
-        $hashOffset = $exeText.IndexOf($marker, [System.StringComparison]::Ordinal) + $marker.Length
+        $hashOffset = Find-ClaudeExeIntegrityHashOffset -ExePath $exePath -AsarName $asarName
         if (($hashOffset + 64) -gt $exeInfo.Length) {
             throw "Claude.exe $asarName integrity marker has invalid bounds."
         }
@@ -2201,11 +2286,7 @@ function Sync-ClaudeExeAsarIntegrity {
         $asarPath = Join-Path $ResourcesPath $asarName
         Write-Host "  [进度] 正在计算 $asarName header hash..." -ForegroundColor DarkGray
         $headerHash = Get-AsarHeaderHash $asarPath
-        $exeText = [System.IO.File]::ReadAllText($exePath, [System.Text.Encoding]::ASCII)
-        $marker = Get-ClaudeExeIntegrityMarker -ExeText $exeText -AsarName $asarName
-        $markerIndex = $exeText.IndexOf($marker, [System.StringComparison]::Ordinal)
-
-        $hashOffset = $markerIndex + $marker.Length
+        $hashOffset = Find-ClaudeExeIntegrityHashOffset -ExePath $exePath -AsarName $asarName
         if (($hashOffset + 64) -gt $exeInfo.Length) {
             throw "Claude.exe $asarName integrity marker has invalid bounds."
         }
@@ -4319,21 +4400,22 @@ function Restart-Claude {
 function Install-WindowsLanguagePack {
     $label = Get-LanguageLabel $LanguageCode
 
-    # 单实例互斥锁：防止多个安装进程并发写入 Claude 资源
-    $mutex = New-Object System.Threading.Mutex($false, "Global\ClaudeDesktopZhCn-Installer")
-    try {
-        if (-not $mutex.WaitOne(0)) {
-            Write-Host "  [错误] 另一个安装进程正在运行，请等待其完成后再试。" -ForegroundColor Red
-            return
-        }
-    } catch [System.Threading.AbandonedMutexException] {
-        # 上一个进程异常退出，锁已释放，继续执行
-    }
-
-    Write-Host "=== Claude Desktop Windows $label 补丁 ===" -ForegroundColor Cyan
-
+    # 单实例互斥锁：使用会话级 Local\ 锁防止普通用户在管理员创建过同名锁后报权限拒绝，
+    # 且竞争失败时明确抛错返回非零退出码（避免静默 return 被调用方误判为成功）。
+    $mutex = New-Object System.Threading.Mutex($false, "Local\ClaudeDesktopZhCn-Installer")
+    $mutexAcquired = $false
     $patchTarget = $null
     try {
+        try {
+            $mutexAcquired = $mutex.WaitOne(0)
+        } catch [System.Threading.AbandonedMutexException] {
+            $mutexAcquired = $true
+        }
+        if (-not $mutexAcquired) {
+            throw "另一个 Claude Desktop 中文补丁进程正在运行，请等待其完成后再试。"
+        }
+
+        Write-Host "=== Claude Desktop Windows $label 补丁 ===" -ForegroundColor Cyan
         Write-Step "[1/7] 检查语言资源"
         $pack = Get-LanguageResources $LanguageCode
 
@@ -4418,7 +4500,9 @@ function Install-WindowsLanguagePack {
         if ($null -ne $patchTarget) {
             Close-FrontendPatchTarget $patchTarget
         }
-        $mutex.ReleaseMutex()
+        if ($mutexAcquired) {
+            try { $mutex.ReleaseMutex() } catch {}
+        }
         $mutex.Dispose()
     }
 }
@@ -4465,6 +4549,18 @@ function Uninstall-WindowsLanguagePack {
         return
     }
 
+    $uninstallMutex = New-Object System.Threading.Mutex($false, "Local\ClaudeDesktopZhCn-Installer")
+    $uninstallMutexAcquired = $false
+    try {
+    try {
+        $uninstallMutexAcquired = $uninstallMutex.WaitOne(0)
+    } catch [System.Threading.AbandonedMutexException] {
+        $uninstallMutexAcquired = $true
+    }
+    if (-not $uninstallMutexAcquired) {
+        throw "另一个 Claude Desktop 中文补丁进程正在运行，请等待其完成后再试。"
+    }
+
     Write-Step "关闭 Claude Desktop"
     Stop-ClaudeProcesses
     Remove-LegacyAppxForkArtifacts
@@ -4495,6 +4591,12 @@ function Uninstall-WindowsLanguagePack {
 
     Write-Host ""
     Write-Host "卸载完成。请重启 Claude Desktop 使更改生效。" -ForegroundColor Green
+    } finally {
+        if ($uninstallMutexAcquired) {
+            try { $uninstallMutex.ReleaseMutex() } catch {}
+        }
+        $uninstallMutex.Dispose()
+    }
 }
 
 function Remove-LegacyFridaResident {

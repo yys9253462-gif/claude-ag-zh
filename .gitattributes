@@ -1,2 +1,4 @@
 /macos/*.command text eol=lf
 /macos/*.py text eol=lf
+/scripts/*.sh text eol=lf
+/scripts/*.py text eol=lf

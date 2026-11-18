@@ -58,9 +58,6 @@ app_version() {
     || echo "unknown"
 }
 
-# 应用升级后，deb 会替换 app.asar 和前端 bundle，但 *.zh-orig 备份会残留为
-# 旧版本文件。若拿旧备份重打补丁，会把旧版程序装回去。因此备份时记录版本号，
-# 版本不一致就丢弃全部旧备份，从当前（升级后全新的）文件重新备份。
 discard_stale_backups() {
   local cur_ver stored_ver
   cur_ver="$(app_version)"
@@ -70,7 +67,6 @@ discard_stale_backups() {
       echo "检测到应用版本变化（$stored_ver -> $cur_ver），丢弃旧版本备份"
       sudo find "$APP_RES" -name "*.zh-orig*" -delete
     fi
-    # 防呆：版本变化后当前 app.asar 应是未打补丁的原版
     if grep -q "__claudeZhOnlineLocaleMain" "$APP_RES/app.asar" 2>/dev/null; then
       die "当前 app.asar 已含补丁但没有对应版本的原始备份，请先重装 claude-desktop deb 包再运行本脚本"
     fi
@@ -83,13 +79,16 @@ merge_json() {
   python3 - "$1" "$2" "$3" <<'PY'
 import json, sys
 base_p, overlay_p, out_p = sys.argv[1:4]
-base = json.load(open(base_p))
-overlay = json.load(open(overlay_p))
+with open(base_p, encoding="utf-8") as f:
+    base = json.load(f)
+with open(overlay_p, encoding="utf-8") as f:
+    overlay = json.load(f)
 merged = dict(base)
 for k, v in overlay.items():
     if k in merged:
         merged[k] = v
-json.dump(merged, open(out_p, "w"), ensure_ascii=False, indent=2)
+with open(out_p, "w", encoding="utf-8") as f:
+    json.dump(merged, f, ensure_ascii=False, indent=2)
 PY
 }
 
@@ -102,15 +101,15 @@ install() {
   ts="$(date +%Y%m%d-%H%M%S)"
   stamp_dir="$BACKUP_DIR/$ts"
   mkdir -p "$stamp_dir"
-  local tmp; tmp="$(mktemp -d)"
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "${tmp:-}"' RETURN
 
   discard_stale_backups
 
   echo "[1/5] 生成语言文件（与当前版本英文合并，新增 key 保留英文）"
   merge_json "$APP_RES/ion-dist/i18n/en-US.json" "$FRONTEND_SRC" "$tmp/frontend.json"
   merge_json "$APP_RES/en-US.json" "$DESKTOP_SRC" "$tmp/desktop.json"
-  # overrides：en-US 无此文件时，用任一现有语言的 overrides 作为 key 模板，
-  # 值取合并后的翻译（有中文用中文，没有保留英文原文）
   local ov_template=""
   for cand in "$APP_RES/ion-dist/i18n/en-US.overrides.json" "$APP_RES"/ion-dist/i18n/*.overrides.json; do
     [ -f "$cand" ] && { ov_template="$cand"; break; }
@@ -119,10 +118,13 @@ install() {
     python3 - "$ov_template" "$tmp/frontend.json" "$tmp/overrides.json" <<'PY'
 import json, sys
 tpl_p, merged_p, out_p = sys.argv[1:4]
-tpl = json.load(open(tpl_p))
-merged = json.load(open(merged_p))
+with open(tpl_p, encoding="utf-8") as f:
+    tpl = json.load(f)
+with open(merged_p, encoding="utf-8") as f:
+    merged = json.load(f)
 out = {k: merged[k] for k in tpl if k in merged}
-json.dump(out, open(out_p, "w"), ensure_ascii=False, indent=2)
+with open(out_p, "w", encoding="utf-8") as f:
+    json.dump(out, f, ensure_ascii=False, indent=2)
 PY
   fi
 
@@ -142,13 +144,15 @@ PY
     sudo python3 - "$f" "$SUFFIX" "$BASE_LIST" "$LABEL_PATCH" <<'PY'
 import sys
 path, lang, base_list, label_patch = sys.argv[1:5]
-s = open(path, encoding="utf-8").read()
+with open(path, encoding="utf-8") as fp:
+    s = fp.read()
 needle = "[" + base_list
 if needle + ',"' + lang + '"' not in s:
     s = s.replace(needle, needle + ',"' + lang + '"')
 if "__claudeZhLabelPatch" not in s:
     s += "\n" + label_patch
-open(path, "w", encoding="utf-8").write(s)
+with open(path, "w", encoding="utf-8") as fp:
+    fp.write(s)
 PY
     patched=$((patched+1))
     echo "  已修补: $(basename "$f")"
@@ -159,22 +163,30 @@ PY
   if [ ! -f "$APP_RES/app.asar.zh-orig" ]; then
     sudo cp -a "$APP_RES/app.asar" "$APP_RES/app.asar.zh-orig"
   fi
-  # 始终基于原始 asar 重打补丁，保证脚本可重复运行
   cp "$APP_RES/app.asar.zh-orig" "$tmp/app.asar"
   python3 "$REPO_DIR/scripts/patch_linux_asar.py" "$tmp/app.asar" "$SUFFIX" "$APP_RES"
   sudo install -m 644 "$tmp/app.asar" "$APP_RES/app.asar"
 
   echo "[5/5] 写入用户配置 locale=$SUFFIX"
   python3 - "$HOME/.config/Claude/config.json" "$SUFFIX" <<'PY'
-import json, sys, os
+import json, os, sys
 path, lang = sys.argv[1:3]
+parent = os.path.dirname(path)
+if parent:
+    os.makedirs(parent, exist_ok=True)
 cfg = {}
 if os.path.exists(path):
-    cfg = json.load(open(path))
+    try:
+        with open(path, encoding="utf-8") as fp:
+            loaded = json.load(fp)
+        if isinstance(loaded, dict):
+            cfg = loaded
+    except Exception:
+        cfg = {}
 cfg["locale"] = lang
-json.dump(cfg, open(path, "w"), ensure_ascii=False, indent="\t")
+with open(path, "w", encoding="utf-8") as fp:
+    json.dump(cfg, fp, ensure_ascii=False, indent="\t")
 PY
-  rm -rf "$tmp"
   echo
   echo "完成！请重新打开 Claude Desktop。如未生效，在左下角账号菜单选择 Language -> 中文。"
   echo "备份位于: $stamp_dir 及各 bundle 旁的 *.zh-orig 文件"
@@ -204,12 +216,18 @@ uninstall() {
   sudo rm -f "$APP_RES/.zh-orig-version"
   echo "[4/4] 重置用户 locale 为 en-US"
   python3 - "$HOME/.config/Claude/config.json" <<'PY'
-import json, sys, os
+import json, os, sys
 path = sys.argv[1]
 if os.path.exists(path):
-    cfg = json.load(open(path))
-    cfg["locale"] = "en-US"
-    json.dump(cfg, open(path, "w"), ensure_ascii=False, indent="\t")
+    try:
+        with open(path, encoding="utf-8") as fp:
+            cfg = json.load(fp)
+        if isinstance(cfg, dict):
+            cfg["locale"] = "en-US"
+            with open(path, "w", encoding="utf-8") as fp:
+                json.dump(cfg, fp, ensure_ascii=False, indent="\t")
+    except Exception:
+        pass
 PY
   echo "完成！请重新打开 Claude Desktop。"
 }

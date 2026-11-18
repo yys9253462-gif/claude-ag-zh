@@ -21,6 +21,7 @@ $ErrorActionPreference = "Stop"
 
 function Disable-ConsoleQuickEdit {
     try {
+        if ([Console]::IsInputRedirected) { return }
         if (-not ("ClaudeZh.ConsoleModeHelper" -as [type])) {
             Add-Type -TypeDefinition @"
 using System;
@@ -118,6 +119,38 @@ $DisabledAsarPath = if ($AsarPath) { "$AsarPath.disabled" } else { "" }
 $UnpackedAppDir = if ($ResourcesDir) { Join-Path $ResourcesDir "app" } else { "" }
 $ExePath = if ($AppDir) { Join-Path $AppDir "Antigravity.exe" } else { "" }
 
+function Invoke-WithTargetMutex {
+    param([scriptblock]$Body)
+
+    $normalizedTarget = if ($AppDir) { [System.IO.Path]::GetFullPath($AppDir).ToLowerInvariant() } else { "default" }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hashBytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($normalizedTarget))
+    } finally {
+        $sha.Dispose()
+    }
+    $suffix = [System.BitConverter]::ToString($hashBytes, 0, 8).Replace("-", "")
+    $mutexName = "Local\ClaudeZh-Antigravity-$suffix"
+    $mutex = New-Object System.Threading.Mutex($false, $mutexName)
+    $acquired = $false
+    try {
+        try {
+            $acquired = $mutex.WaitOne(0)
+        } catch [System.Threading.AbandonedMutexException] {
+            $acquired = $true
+        }
+        if (-not $acquired) {
+            throw "另一个 Antigravity 中文补丁任务正在运行，请等待其完成后再试。"
+        }
+        & $Body
+    } finally {
+        if ($acquired) {
+            try { $mutex.ReleaseMutex() } catch {}
+        }
+        $mutex.Dispose()
+    }
+}
+
 function Get-AntigravityStatus {
     $installed = $false
     $patched = $false
@@ -212,33 +245,84 @@ function Stop-AntigravityProcesses {
 
 function Expand-AsarNode {
     param(
-        [System.IO.BinaryReader]$Reader,
+        [System.IO.Stream]$Stream,
         [long]$BaseOffset,
         [object]$Node,
-        [string]$CurrentPath
+        [string]$DestRoot,
+        [string]$ArchivePath,
+        [string]$RelativePrefix,
+        [byte[]]$Buffer
     )
-    if (-not (Test-Path -LiteralPath $CurrentPath)) {
-        $null = New-Item -ItemType Directory -Path $CurrentPath -Force
+    $currentDir = if ($RelativePrefix) { Join-Path $DestRoot $RelativePrefix } else { $DestRoot }
+    if (-not (Test-Path -LiteralPath $currentDir)) {
+        $null = New-Item -ItemType Directory -Path $currentDir -Force
     }
+    $rootPrefix = $DestRoot + [System.IO.Path]::DirectorySeparatorChar
     foreach ($prop in $Node.PSObject.Properties) {
-        $name = $prop.Name
+        $name = [string]$prop.Name
+        if (-not $name -or $name -in @(".", "..") -or $name.IndexOfAny([char[]]@('/', '\')) -ge 0) {
+            throw "ASAR 包含不安全条目名称: $name"
+        }
+        $relative = if ($RelativePrefix) { Join-Path $RelativePrefix $name } else { $name }
+        $targetPath = [System.IO.Path]::GetFullPath((Join-Path $DestRoot $relative))
+        if (-not $targetPath.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "ASAR 条目路径越界: $relative"
+        }
+
         $info = $prop.Value
-        $targetPath = Join-Path $CurrentPath $name
         if ($null -ne $info.PSObject.Properties["files"]) {
-            Expand-AsarNode -Reader $Reader -BaseOffset $BaseOffset -Node $info.files -CurrentPath $targetPath
-        } elseif ($null -ne $info.PSObject.Properties["offset"]) {
-            $offset = [long]$info.offset
-            $size = [int]$info.size
-            $parent = Split-Path -Parent $targetPath
-            if (-not (Test-Path -LiteralPath $parent)) {
-                $null = New-Item -ItemType Directory -Path $parent -Force
+            Expand-AsarNode -Stream $Stream -BaseOffset $BaseOffset -Node $info.files -DestRoot $DestRoot -ArchivePath $ArchivePath -RelativePrefix $relative -Buffer $Buffer
+            continue
+        }
+        if ($null -ne $info.PSObject.Properties["link"]) {
+            throw "ASAR 包含不支持的符号链接条目: $relative"
+        }
+
+        $parent = Split-Path -Parent $targetPath
+        if (-not (Test-Path -LiteralPath $parent)) {
+            $null = New-Item -ItemType Directory -Path $parent -Force
+        }
+
+        if ($null -ne $info.PSObject.Properties["unpacked"] -and [bool]$info.unpacked) {
+            $unpackedRoot = [System.IO.Path]::GetFullPath(($ArchivePath + ".unpacked")).TrimEnd('\', '/')
+            if (-not (Test-Path -LiteralPath $unpackedRoot -PathType Container)) {
+                $fallbackUnpacked = Join-Path (Split-Path -Parent $ArchivePath) "app.asar.unpacked"
+                if (Test-Path -LiteralPath $fallbackUnpacked -PathType Container) {
+                    $unpackedRoot = [System.IO.Path]::GetFullPath($fallbackUnpacked).TrimEnd('\', '/')
+                }
             }
-            $Reader.BaseStream.Seek($BaseOffset + $offset, [System.IO.SeekOrigin]::Begin) | Out-Null
-            if ($size -gt 0) {
-                $bytes = $Reader.ReadBytes($size)
-                [System.IO.File]::WriteAllBytes($targetPath, $bytes)
-            } else {
-                [System.IO.File]::WriteAllBytes($targetPath, [byte[]]@())
+            $unpackedSource = [System.IO.Path]::GetFullPath((Join-Path $unpackedRoot $relative))
+            if (-not $unpackedSource.StartsWith($unpackedRoot + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "ASAR unpacked 路径越界: $relative"
+            }
+            if (-not (Test-Path -LiteralPath $unpackedSource -PathType Leaf)) {
+                throw "缺少 ASAR unpacked 外部文件: $unpackedSource"
+            }
+            Copy-Item -LiteralPath $unpackedSource -Destination $targetPath -Force
+            continue
+        }
+
+        if ($null -ne $info.PSObject.Properties["offset"]) {
+            $offset = [int64]$info.offset
+            $size = [int64]$info.size
+            if ($offset -lt 0 -or $size -lt 0 -or ($BaseOffset + $offset + $size) -gt $Stream.Length) {
+                throw "ASAR 条目数据边界无效: $relative (offset=$offset, size=$size, stream=$($Stream.Length))"
+            }
+            $Stream.Position = $BaseOffset + $offset
+            $outStream = [System.IO.File]::Open($targetPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            try {
+                $remaining = $size
+                while ($remaining -gt 0) {
+                    $chunk = [int][Math]::Min([int64]$Buffer.Length, $remaining)
+                    $read = $Stream.Read($Buffer, 0, $chunk)
+                    if ($read -le 0) {
+                        throw "ASAR 条目内容提前结束: $relative"
+                    }
+                    $outStream.Write($Buffer, 0, $read)
+                    $remaining -= $read
+                }
+            } finally {
+                $outStream.Dispose()
             }
         }
     }
@@ -249,22 +333,30 @@ function Expand-AsarArchive {
         [string]$ArchivePath,
         [string]$DestDir
     )
-    $fs = [System.IO.File]::OpenRead($ArchivePath)
+    $fullDest = [System.IO.Path]::GetFullPath($DestDir).TrimEnd('\', '/')
+    $fs = [System.IO.File]::Open($ArchivePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
     $reader = [System.IO.BinaryReader]::new($fs)
     try {
+        if ($fs.Length -lt 16) {
+            throw "ASAR 文件体积异常 ($($fs.Length) bytes)"
+        }
         $magic = $reader.ReadUInt32()
         $size = $reader.ReadUInt32()
         $u1 = $reader.ReadUInt32()
         $headerSize = $reader.ReadUInt32()
-        if ($magic -ne 4 -or $headerSize -le 0) {
-            throw "ASAR 文件头格式异常 (magic=$magic, headerSize=$headerSize)"
+        $baseOffset = [int64]8 + [int64]$size
+        if ($magic -ne 4 -or $headerSize -le 0 -or $baseOffset -gt $fs.Length -or (16 + [int64]$headerSize) -gt $baseOffset) {
+            throw "ASAR 文件头格式异常 (magic=$magic, headerSize=$headerSize, size=$size)"
         }
         $headerBytes = $reader.ReadBytes([int]$headerSize)
+        if ($headerBytes.Length -ne [int]$headerSize) {
+            throw "ASAR 文件头读取不完整"
+        }
         $headerJson = [System.Text.Encoding]::UTF8.GetString($headerBytes)
         $header = $headerJson | ConvertFrom-Json
-        $baseOffset = [long]8 + [long]$size
         if ($null -ne $header.files) {
-            Expand-AsarNode -Reader $reader -BaseOffset $baseOffset -Node $header.files -CurrentPath $DestDir
+            $copyBuffer = [byte[]]::new(262144)
+            Expand-AsarNode -Stream $fs -BaseOffset $baseOffset -Node $header.files -DestRoot $fullDest -ArchivePath $ArchivePath -RelativePrefix "" -Buffer $copyBuffer
         }
     } finally {
         $reader.Dispose()
@@ -343,53 +435,63 @@ function Invoke-AntigravityInstall {
         throw "未检测到 Antigravity 安装目录：$AppDir"
     }
 
-    Stop-AntigravityProcesses
+    Invoke-WithTargetMutex {
+        Stop-AntigravityProcesses
 
-    $isFreshInstall = (Test-Path -LiteralPath $AsarPath) -and (-not (Test-Path -LiteralPath $DisabledAsarPath))
-    if ($isFreshInstall -and (Test-Path -LiteralPath $UnpackedAppDir)) {
-        Write-Host "[状态] 检测到客户端可能已更新，正在清理旧的解包缓存..."
-        Remove-Item -LiteralPath $UnpackedAppDir -Recurse -Force
-    }
-
-    if (-not (Test-Path -LiteralPath $UnpackedAppDir)) {
-        $sourceAsar = if (Test-Path -LiteralPath $AsarPath) { $AsarPath } elseif (Test-Path -LiteralPath $DisabledAsarPath) { $DisabledAsarPath } else { "" }
-        if (-not $sourceAsar) {
-            throw "未找到 app.asar：$AsarPath"
+        $isFreshInstall = (Test-Path -LiteralPath $AsarPath) -and (-not (Test-Path -LiteralPath $DisabledAsarPath))
+        if ($isFreshInstall -and (Test-Path -LiteralPath $UnpackedAppDir)) {
+            Write-Host "[状态] 检测到客户端可能已更新，正在清理旧的解包缓存..."
+            Remove-Item -LiteralPath $UnpackedAppDir -Recurse -Force
         }
-        Write-Host "[执行] 正在解包 app.asar 核心文件（纯 PowerShell 原生解析器）..."
-        Expand-AsarArchive -ArchivePath $sourceAsar -DestDir $UnpackedAppDir
-        Write-Host "[完成] app.asar 解包完成。"
-    } else {
-        Write-Host "[状态] 发现已解包工作目录：$UnpackedAppDir"
-    }
 
-    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-    $domJs = [System.IO.File]::ReadAllText($DomTranslatorPath, $utf8NoBom)
-    $menuJs = [System.IO.File]::ReadAllText($MenuTranslatorPath, $utf8NoBom)
-
-    $preloadPath = Join-Path $UnpackedAppDir "dist\preload.js"
-    $menuPath = Join-Path $UnpackedAppDir "dist\menu.js"
-    $trayPath = Join-Path $UnpackedAppDir "dist\tray.js"
-    $loadingPath = Join-Path $UnpackedAppDir "dist\loadingOverlay.js"
-
-    Add-IdempotentInjection -FilePath $preloadPath -PayloadContent $domJs -Marker "Antigravity Chinese Localization Engine" -Label "Web UI Injection"
-    Add-IdempotentInjection -FilePath $menuPath -PayloadContent $menuJs -Marker "Antigravity Chinese Localization Engine - Menu" -Label "Menu Translator Injection"
-
-    Update-TextExact -FilePath $trayPath -Target "'Show Antigravity'" -Replacement "'显示 Antigravity'"
-    Update-TextExact -FilePath $trayPath -Target "'Quit'" -Replacement "'退出'"
-    Update-TextExact -FilePath $loadingPath -Target ">Loading Antigravity<" -Replacement ">正在加载 Antigravity<"
-
-    if (Test-Path -LiteralPath $AsarPath) {
-        Write-Host "[执行] 正在禁用官方 app.asar，以强制读取汉化目录..."
-        if (Test-Path -LiteralPath $DisabledAsarPath) {
-            Remove-Item -LiteralPath $DisabledAsarPath -Force
+        if (-not (Test-Path -LiteralPath $UnpackedAppDir)) {
+            $sourceAsar = if (Test-Path -LiteralPath $AsarPath) { $AsarPath } elseif (Test-Path -LiteralPath $DisabledAsarPath) { $DisabledAsarPath } else { "" }
+            if (-not $sourceAsar) {
+                throw "未找到 app.asar：$AsarPath"
+            }
+            Write-Host "[执行] 正在解包 app.asar 核心文件（纯 PowerShell 流式安全解析器）..."
+            $tempUnpacked = "$UnpackedAppDir.tmp-" + [guid]::NewGuid().ToString("N")
+            try {
+                Expand-AsarArchive -ArchivePath $sourceAsar -DestDir $tempUnpacked
+                Move-Item -LiteralPath $tempUnpacked -Destination $UnpackedAppDir -Force
+            } finally {
+                if (Test-Path -LiteralPath $tempUnpacked) {
+                    Remove-Item -LiteralPath $tempUnpacked -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
+            Write-Host "[完成] app.asar 解包完成。"
+        } else {
+            Write-Host "[状态] 发现已解包工作目录：$UnpackedAppDir"
         }
-        Move-Item -LiteralPath $AsarPath -Destination $DisabledAsarPath -Force
-        Write-Host "[成功] app.asar -> app.asar.disabled"
-    }
 
-    Write-Host "[完成] Antigravity 简体中文补丁注入成功！"
-    Start-AntigravityIfAllowed
+        $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+        $domJs = [System.IO.File]::ReadAllText($DomTranslatorPath, $utf8NoBom)
+        $menuJs = [System.IO.File]::ReadAllText($MenuTranslatorPath, $utf8NoBom)
+
+        $preloadPath = Join-Path $UnpackedAppDir "dist\preload.js"
+        $menuPath = Join-Path $UnpackedAppDir "dist\menu.js"
+        $trayPath = Join-Path $UnpackedAppDir "dist\tray.js"
+        $loadingPath = Join-Path $UnpackedAppDir "dist\loadingOverlay.js"
+
+        Add-IdempotentInjection -FilePath $preloadPath -PayloadContent $domJs -Marker "Antigravity Chinese Localization Engine" -Label "Web UI Injection"
+        Add-IdempotentInjection -FilePath $menuPath -PayloadContent $menuJs -Marker "Antigravity Chinese Localization Engine - Menu" -Label "Menu Translator Injection"
+
+        Update-TextExact -FilePath $trayPath -Target "'Show Antigravity'" -Replacement "'显示 Antigravity'"
+        Update-TextExact -FilePath $trayPath -Target "'Quit'" -Replacement "'退出'"
+        Update-TextExact -FilePath $loadingPath -Target ">Loading Antigravity<" -Replacement ">正在加载 Antigravity<"
+
+        if (Test-Path -LiteralPath $AsarPath) {
+            Write-Host "[执行] 正在禁用官方 app.asar，以强制读取汉化目录..."
+            if (Test-Path -LiteralPath $DisabledAsarPath) {
+                Remove-Item -LiteralPath $DisabledAsarPath -Force
+            }
+            Move-Item -LiteralPath $AsarPath -Destination $DisabledAsarPath -Force
+            Write-Host "[成功] app.asar -> app.asar.disabled"
+        }
+
+        Write-Host "[完成] Antigravity 简体中文补丁注入成功！"
+        Start-AntigravityIfAllowed
+    }
 }
 
 function Invoke-AntigravityUninstall {
@@ -397,33 +499,35 @@ function Invoke-AntigravityUninstall {
         throw "未检测到 Antigravity 安装目录：$AppDir"
     }
 
-    $hasDisabled = Test-Path -LiteralPath $DisabledAsarPath
-    $hasUnpacked = Test-Path -LiteralPath $UnpackedAppDir
-    if (-not $hasDisabled -and -not $hasUnpacked) {
-        Write-Host "[状态] 未发现已禁用的 app.asar.disabled 或解包残留，Antigravity 已是官方原版状态，无需恢复。"
-        return
-    }
-
-    Stop-AntigravityProcesses
-
-    if ($hasDisabled) {
-        Write-Host "[执行] 正在恢复官方 app.asar..."
-        if (Test-Path -LiteralPath $AsarPath) {
-            Remove-Item -LiteralPath $AsarPath -Force
+    Invoke-WithTargetMutex {
+        $hasDisabled = Test-Path -LiteralPath $DisabledAsarPath
+        $hasUnpacked = Test-Path -LiteralPath $UnpackedAppDir
+        if (-not $hasDisabled -and -not $hasUnpacked) {
+            Write-Host "[状态] 未发现已禁用的 app.asar.disabled 或解包残留，Antigravity 已是官方原版状态，无需恢复。"
+            return
         }
-        Move-Item -LiteralPath $DisabledAsarPath -Destination $AsarPath -Force
-        if (Test-Path -LiteralPath $UnpackedAppDir) {
+
+        Stop-AntigravityProcesses
+
+        if ($hasDisabled) {
+            Write-Host "[执行] 正在恢复官方 app.asar..."
+            if (Test-Path -LiteralPath $AsarPath) {
+                Remove-Item -LiteralPath $AsarPath -Force
+            }
+            Move-Item -LiteralPath $DisabledAsarPath -Destination $AsarPath -Force
+            if (Test-Path -LiteralPath $UnpackedAppDir) {
+                Remove-Item -LiteralPath $UnpackedAppDir -Recurse -Force
+            }
+            Write-Host "[完成] 已无损恢复 Antigravity 官方原版文件。"
+            Start-AntigravityIfAllowed
+            return
+        }
+
+        if ($hasUnpacked) {
+            Write-Host "[执行] 正在清理残留解包目录：$UnpackedAppDir"
             Remove-Item -LiteralPath $UnpackedAppDir -Recurse -Force
+            Write-Host "[完成] 已清理汉化残留，当前为原版状态。"
         }
-        Write-Host "[完成] 已无损恢复 Antigravity 官方原版文件。"
-        Start-AntigravityIfAllowed
-        return
-    }
-
-    if ($hasUnpacked) {
-        Write-Host "[执行] 正在清理残留解包目录：$UnpackedAppDir"
-        Remove-Item -LiteralPath $UnpackedAppDir -Recurse -Force
-        Write-Host "[完成] 已清理汉化残留，当前为原版状态。"
     }
 }
 
