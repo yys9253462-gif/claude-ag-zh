@@ -27,7 +27,9 @@ internal static class EntryPoint
             !File.Exists(Path.Combine(resources, "frontend-zh-CN.json")) ||
             !File.Exists(Path.Combine(resources, "frontend-hardcoded-zh-CN.json")) ||
             !File.Exists(Path.Combine(agResources, "dom-translator.js")) ||
-            !File.Exists(Path.Combine(agResources, "menu-translator.js")))
+            !File.Exists(Path.Combine(agResources, "menu-translator.js")) ||
+            !File.Exists(Path.Combine(agResources, "swarm-translator.js")) ||
+            !File.Exists(Path.Combine(agResources, "swarm-redirects-hook.js")))
         {
             Console.Error.WriteLine("内嵌资源不完整。");
             return 1;

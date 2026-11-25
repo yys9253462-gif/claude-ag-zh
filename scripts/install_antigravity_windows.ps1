@@ -95,6 +95,8 @@ $RepoRoot = Split-Path -Parent $ScriptDir
 $AntigravityResDir = Join-Path $RepoRoot "resources\antigravity"
 $DomTranslatorPath = Join-Path $AntigravityResDir "dom-translator.js"
 $MenuTranslatorPath = Join-Path $AntigravityResDir "menu-translator.js"
+$SwarmTranslatorPath = Join-Path $AntigravityResDir "swarm-translator.js"
+$SwarmHookPath = Join-Path $AntigravityResDir "swarm-redirects-hook.js"
 
 if ($Language -ne "zh-CN") {
     Write-Host "[错误] Antigravity 汉化当前仅支持简体中文（zh-CN），不支持: $Language" -ForegroundColor Red
@@ -190,6 +192,14 @@ function Invoke-SelfTest {
     }
     if (-not (Test-Path -LiteralPath $MenuTranslatorPath)) {
         Write-Host "[错误] 缺少内嵌资源: $MenuTranslatorPath" -ForegroundColor Red
+        exit 1
+    }
+    if (-not (Test-Path -LiteralPath $SwarmTranslatorPath)) {
+        Write-Host "[错误] 缺少内嵌资源: $SwarmTranslatorPath" -ForegroundColor Red
+        exit 1
+    }
+    if (-not (Test-Path -LiteralPath $SwarmHookPath)) {
+        Write-Host "[错误] 缺少内嵌资源: $SwarmHookPath" -ForegroundColor Red
         exit 1
     }
     $st = Get-AntigravityStatus
@@ -428,7 +438,7 @@ function Start-AntigravityIfAllowed {
 }
 
 function Invoke-AntigravityInstall {
-    if (-not (Test-Path -LiteralPath $DomTranslatorPath) -or -not (Test-Path -LiteralPath $MenuTranslatorPath)) {
+    if (-not (Test-Path -LiteralPath $DomTranslatorPath) -or -not (Test-Path -LiteralPath $MenuTranslatorPath) -or -not (Test-Path -LiteralPath $SwarmTranslatorPath) -or -not (Test-Path -LiteralPath $SwarmHookPath)) {
         throw "缺少 Antigravity 汉化资源文件：$AntigravityResDir"
     }
     if (-not $ResourcesDir -or -not (Test-Path -LiteralPath $ResourcesDir)) {
@@ -467,14 +477,24 @@ function Invoke-AntigravityInstall {
         $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
         $domJs = [System.IO.File]::ReadAllText($DomTranslatorPath, $utf8NoBom)
         $menuJs = [System.IO.File]::ReadAllText($MenuTranslatorPath, $utf8NoBom)
+        $swarmJs = [System.IO.File]::ReadAllText($SwarmTranslatorPath, $utf8NoBom)
+        $swarmHookJs = [System.IO.File]::ReadAllText($SwarmHookPath, $utf8NoBom)
 
         $preloadPath = Join-Path $UnpackedAppDir "dist\preload.js"
         $menuPath = Join-Path $UnpackedAppDir "dist\menu.js"
+        $redirectsPath = Join-Path $UnpackedAppDir "dist\redirects.js"
+        $swarmTargetPath = Join-Path $UnpackedAppDir "dist\swarm-translator.js"
         $trayPath = Join-Path $UnpackedAppDir "dist\tray.js"
         $loadingPath = Join-Path $UnpackedAppDir "dist\loadingOverlay.js"
 
         Add-IdempotentInjection -FilePath $preloadPath -PayloadContent $domJs -Marker "Antigravity Chinese Localization Engine" -Label "Web UI Injection"
         Add-IdempotentInjection -FilePath $menuPath -PayloadContent $menuJs -Marker "Antigravity Chinese Localization Engine - Menu" -Label "Menu Translator Injection"
+        if (Test-Path -LiteralPath $redirectsPath) {
+            [System.IO.File]::WriteAllText($swarmTargetPath, $swarmJs, $utf8NoBom)
+            Add-IdempotentInjection -FilePath $redirectsPath -PayloadContent $swarmHookJs -Marker "Antigravity Chinese Localization Engine - Swarm" -Label "Swarm Sidecar Injection"
+        } else {
+            Write-Host "[提示] 当前版本未包含 dist\redirects.js，已跳过蜂群边车注入。"
+        }
 
         Update-TextExact -FilePath $trayPath -Target "'Show Antigravity'" -Replacement "'显示 Antigravity'"
         Update-TextExact -FilePath $trayPath -Target "'Quit'" -Replacement "'退出'"
