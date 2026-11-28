@@ -10,7 +10,7 @@ const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const PYTHON = process.platform === "win32" ? "python" : "python3";
 
 function runPython(code, extraArgs = []) {
-  return spawnSync(PYTHON, ["-I", "-c", code, ...extraArgs], {
+  return spawnSync(PYTHON, ["-I", "-X", "utf8", "-c", code, ...extraArgs], {
     cwd: REPO_ROOT,
     encoding: "utf8",
   });

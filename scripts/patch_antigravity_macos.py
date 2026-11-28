@@ -52,8 +52,26 @@ REQUIRED_RESOURCE_FILES = (
 )
 
 
+def _ensure_utf8_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconf = getattr(stream, "reconfigure", None)
+        if callable(reconf):
+            try:
+                reconf(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+_ensure_utf8_stdio()
+
+
 def log(msg: str) -> None:
-    print(f"[antigravity-macos-zh] {msg}", flush=True)
+    line = f"[antigravity-macos-zh] {msg}"
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        sys.stdout.buffer.write((line + "\n").encode("utf-8", errors="replace"))
+        sys.stdout.flush()
 
 
 def default_resources_dir() -> Path:
