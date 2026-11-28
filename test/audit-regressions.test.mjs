@@ -389,7 +389,7 @@ test("Antigravity 菜单与 DOM 翻译引擎具备空项防御、助记符支持
 });
 
 test("跨平台 Linux 与 macOS 脚本统一保持 LF 行尾，避免直接运行报换行符错误", async () => {
-  for (const rel of ["scripts/install_linux.sh", "macos/launch.command", "macos/package.py", "scripts/patch_linux_asar.py"]) {
+  for (const rel of ["scripts/install_linux.sh", "macos/launch.command", "macos/package.py", "macos/build_dmg.sh", "macos/verify_on_macos.py", "scripts/patch_linux_asar.py", "scripts/patch_antigravity_macos.py"]) {
     const raw = await readBytes(rel);
     assert.equal(raw.includes(0x0d), false, `${rel} 不得包含 CR (\\r) 字符`);
   }

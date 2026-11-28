@@ -1,0 +1,72 @@
+name: macos-dmg
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "可选：填写已有发行版标签（如 v0.5.0）将自动把原生 .dmg 与 .zip 附件上传到该发行版"
+        required: false
+        default: ""
+        type: string
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos-dmg:
+    runs-on: macos-latest
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python 3.12 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 配置 Node.js 22 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: 运行 macOS 单元测试
+        run: node --test test/macos.test.mjs
+
+      - name: 在真实 macOS 环境验证 ditto 备份、ASAR 修补、codesign 严格验签与无损恢复
+        run: python3 -I -B macos/verify_on_macos.py
+
+      - name: 构建苹果原生 .dmg 磁盘镜像与 .zip 便携包并执行挂载自检
+        run: bash macos/build_dmg.sh
+
+      - name: 输出构建产物清单与校验和
+        run: |
+          ls -lh artifacts/macos/
+          cat artifacts/macos/*.sha256
+
+      - name: 上传构建产物到工作流构件
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg-package
+          path: |
+            artifacts/macos/*.dmg
+            artifacts/macos/*.dmg.sha256
+            artifacts/macos/*.zip
+            artifacts/macos/*.zip.sha256
+          retention-days: 30
+
+      - name: 上传原生 .dmg 与 .zip 附件到目标发行版
+        if: ${{ github.event_name == 'release' || inputs.release_tag != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          shopt -s nullglob
+          files=(artifacts/macos/*.dmg artifacts/macos/*.dmg.sha256 artifacts/macos/*.zip artifacts/macos/*.zip.sha256)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "未找到可上传的 macOS 构建产物" >&2
+            exit 1
+          fi
+          gh release upload "$TARGET_TAG" "${files[@]}" --clobber
+          gh release view "$TARGET_TAG" --json tagName,url,assets
