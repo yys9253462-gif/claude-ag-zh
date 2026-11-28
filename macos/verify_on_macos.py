@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """在真实 macOS 环境中对 patch_antigravity_macos.py 做真机签名与备份恢复端到端验证。
 
-构造带真实 Mach-O 主可执行文件、ElectronAsarIntegrity 与 Electron 37+ 摘要槽位的沙箱 Antigravity.app，
-完整实跑 ditto 备份、ASAR 就地差量修补、完整性同步、codesign 临时重签名（含 strict 验签）与无损恢复。
+构造带真实 Mach-O 主可执行文件、标准 Electron Framework 动态库（含 Electron 37+ 摘要槽位）
+与 ElectronAsarIntegrity 的沙箱 Antigravity.app，完整实跑 ditto 备份、ASAR 就地差量修补、
+完整性同步、codesign 临时重签名（含 strict 验签）与无损恢复。
 """
 from __future__ import annotations
 
 import json
+import os
 import platform
 import plistlib
-import shutil
 import struct
 import subprocess
 import sys
@@ -53,6 +54,55 @@ def build_mini_asar(out_path: Path, files_spec: dict[str, bytes]) -> tuple[str, 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(blob)
     return core.asar_header_hash(hstr), blob
+
+
+def build_mock_electron_framework(app: Path, td_path: Path, initial_digest: str) -> None:
+    """构造符合苹果 bundle 规范的 Electron Framework.framework（真 Mach-O 动态库 + 内嵌摘要槽位）。"""
+    fw_bundle = app / "Contents/Frameworks/Electron Framework.framework"
+    ver_a = fw_bundle / "Versions/A"
+    res_dir = ver_a / "Resources"
+    res_dir.mkdir(parents=True, exist_ok=True)
+
+    sentinel_ascii = core.INTEGRITY_DIGEST_SENTINEL.decode("ascii")
+    slot_literal = f"{sentinel_ascii}10{initial_digest}"
+    fw_c = td_path / "electron_fw.c"
+    fw_c.write_text(
+        f'__attribute__((used)) const char ELECTRON_SLOT[] = "{slot_literal}";\n'
+        'int electron_fw_anchor(void) { return (int)ELECTRON_SLOT[0]; }\n',
+        encoding="ascii",
+    )
+    fw_bin = ver_a / "Electron Framework"
+    subprocess.run(
+        [
+            "/usr/bin/clang",
+            "-dynamiclib",
+            "-install_name",
+            "@rpath/Electron Framework.framework/Versions/A/Electron Framework",
+            str(fw_c),
+            "-o",
+            str(fw_bin),
+        ],
+        check=True,
+    )
+
+    (res_dir / "Info.plist").write_bytes(
+        plistlib.dumps(
+            {
+                "CFBundleIdentifier": "com.github.Electron.framework",
+                "CFBundleName": "Electron Framework",
+                "CFBundleExecutable": "Electron Framework",
+                "CFBundlePackageType": "FMWK",
+                "CFBundleShortVersionString": "37.0.0",
+                "CFBundleVersion": "37.0.0",
+            },
+            fmt=plistlib.FMT_BINARY,
+        )
+    )
+
+    # 标准 macOS Versioned Framework 软链接布局
+    os.symlink("A", fw_bundle / "Versions/Current")
+    os.symlink("Versions/Current/Electron Framework", fw_bundle / "Electron Framework")
+    os.symlink("Versions/Current/Resources", fw_bundle / "Resources")
 
 
 def main() -> int:
@@ -100,15 +150,24 @@ def main() -> int:
             )
         )
 
-        # 构造模拟 Electron Framework 的摘要槽位用于真实校验
-        fw_path = app / core.ELECTRON_FRAMEWORK_REL
-        fw_path.parent.mkdir(parents=True, exist_ok=True)
-        orig_digest = core.compute_integrity_dictionary_digest(integrity_dict).encode("ascii")
-        fw_path.write_bytes(b"HEADER" + core.INTEGRITY_DIGEST_SENTINEL + b"10" + orig_digest + b"TRAILER")
+        # 构造符合苹果规范的真实 Mach-O Electron Framework（含 Electron 37+ 摘要槽位）
+        orig_digest = core.compute_integrity_dictionary_digest(integrity_dict)
+        build_mock_electron_framework(app, td_path, orig_digest)
 
-        # 初始给沙箱应用签一个模拟“官方”基线签名
+        # 初始给沙箱应用签一个模拟“官方”基线签名（先签嵌套框架，再签外层应用）
         subprocess.run(
-            ["/usr/bin/codesign", "--force", "--deep", "--sign", "-", "--timestamp=none", str(app)],
+            [
+                "/usr/bin/codesign",
+                "--force",
+                "--sign",
+                "-",
+                "--timestamp=none",
+                str(app / "Contents/Frameworks/Electron Framework.framework/Versions/A"),
+            ],
+            check=True,
+        )
+        subprocess.run(
+            ["/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", str(app)],
             check=True,
         )
 
